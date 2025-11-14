@@ -4,14 +4,15 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.optim import Adam
 from torchvision import transforms
+from torchvision.utils import save_image
 from tqdm import tqdm  # 进度条（需pip install tqdm）
 
 # 导入自定义模块
 from models import UNetGenerator, PatchDiscriminator
-from dataset import ImageInpaintingDataset
+from dataset import ImageInpaintingDataset, TrainTestSplitDataset
 from losses import PerceptualLoss, L1MaskedLoss, GANLoss
 from config import *  # 导入所有配置
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from PIL import Image, ImageDraw
 import numpy as np
 import random
@@ -125,23 +126,52 @@ def main():
     # 掩码类型：MASK_TYPE 可选 ["random_rect", "center"]；
     # - random_rect：生成若干随机矩形缺失，更贴近期望的随机遮挡场景；
     # - center：在图像中心生成方形掩码，适合特定分布或验证一致性。
-    train_dataset = RobustImageInpaintingDataset(
+    
+    # 首先加载完整的训练数据集
+    full_train_dataset = ImageInpaintingDataset(
         data_dir=DATA_DIR_TRAIN,
-        transform=train_transform,  # 训练集用增强
-        mask_type=MASK_TYPE
+        transform=train_transform,
+        mask_type=MASK_TYPE,
+        mask_dir="../data/mask",
+        use_external_mask=True,
+        external_mask_is_valid_region=False,
+        external_mask_dilate=0,
+        external_mask_mode="random"
     )
-    val_dataset = RobustImageInpaintingDataset(
+    
+    # 从训练集中分割最后20%作为测试集
+    train_dataset = TrainTestSplitDataset(full_train_dataset, test_ratio=0.2, is_test=False)
+    test_dataset = TrainTestSplitDataset(full_train_dataset, test_ratio=0.2, is_test=True)
+    
+    val_dataset = ImageInpaintingDataset(
         data_dir=DATA_DIR_VAL,
-        transform=val_test_transform,  # 验证集用无增强
-        mask_type=MASK_TYPE
+        transform=val_test_transform,
+        mask_type=MASK_TYPE,
+        mask_dir="../data/mask",
+        use_external_mask=True,
+        external_mask_is_valid_region=False,
+        external_mask_dilate=0,
+        external_mask_mode="cycle"
     )
-    test_dataset = RobustImageInpaintingDataset(
-        data_dir=DATA_DIR_TEST,
-        transform=val_test_transform,  # 测试集用无增强
-        mask_type=MASK_TYPE
-    )
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+    def visualize_samples(dataset, out_dir, prefix, count=3):
+        os.makedirs(out_dir, exist_ok=True)
+        n = min(count, len(dataset))
+        for i in range(n):
+            img, mask = dataset[i]
+            img_vis = img * 0.5 + 0.5
+            masked = img * (1 - mask)
+            masked_vis = masked * 0.5 + 0.5
+            save_image(img_vis, os.path.join(out_dir, f"{prefix}_{i}_img.png"))
+            save_image(mask, os.path.join(out_dir, f"{prefix}_{i}_mask.png"))
+            save_image(masked_vis, os.path.join(out_dir, f"{prefix}_{i}_masked.png"))
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    preview_dir = os.path.join(OUTPUT_DIR, "preview")
+    visualize_samples(train_dataset, preview_dir, "train", count=3)
+    visualize_samples(val_dataset, preview_dir, "val", count=2)
+    visualize_samples(test_dataset, preview_dir, "test", count=2)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
     # DataLoader 提示：Windows 平台上 num_workers 过大可能导致启动缓慢或卡住；
     # 如遇问题可将训练/验证的 num_workers 降为 0 或 1 进行排查。
 
@@ -156,8 +186,8 @@ def main():
 
     opt_gen = Adam(gen.parameters(), lr=LEARNING_RATE, betas=ADAM_BETAS)
     opt_dis = Adam(dis.parameters(), lr=LEARNING_RATE, betas=ADAM_BETAS)
-    scaler_gen = GradScaler(enabled=USE_MIXED_PRECISION)
-    scaler_dis = GradScaler(enabled=USE_MIXED_PRECISION)
+    scaler_gen = GradScaler(device='cuda', enabled=USE_MIXED_PRECISION)
+    scaler_dis = GradScaler(device='cuda', enabled=USE_MIXED_PRECISION)
 
     # 记录最佳验证损失（用于保存最佳模型）
     best_val_loss = float('inf')
@@ -177,7 +207,7 @@ def main():
 
             # 训练判别器
             opt_dis.zero_grad()
-            with autocast(enabled=USE_MIXED_PRECISION):
+            with autocast(device_type='cuda', enabled=USE_MIXED_PRECISION):
                 fake_imgs = gen(real_imgs, masks)
                 real_pred = dis(real_imgs)
                 fake_pred = dis(fake_imgs.detach())
@@ -190,7 +220,7 @@ def main():
 
             # 训练生成器
             opt_gen.zero_grad()
-            with autocast(enabled=USE_MIXED_PRECISION):
+            with autocast(device_type='cuda', enabled=USE_MIXED_PRECISION):
                 fake_imgs = gen(real_imgs, masks)
                 fake_pred = dis(fake_imgs)
                 loss_gan = gan_loss(fake_pred, target_is_real=True)
@@ -218,7 +248,7 @@ def main():
             for real_imgs, masks in tqdm(val_loader, desc=f"Epoch {epoch+1}/{EPOCHS} (Val)"):
                 real_imgs = real_imgs.to(device)
                 masks = masks.to(device)
-                with autocast(enabled=USE_MIXED_PRECISION):
+                with autocast(device_type='cuda', enabled=USE_MIXED_PRECISION):
                     fake_imgs = gen(real_imgs, masks)
 
                 # 仅计算生成器损失（验证阶段重点关注生成效果）
