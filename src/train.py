@@ -1,7 +1,7 @@
 import os
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torch.optim import Adam
 from torchvision import transforms
 from torchvision.utils import save_image
@@ -127,7 +127,7 @@ def main():
     # - random_rect：生成若干随机矩形缺失，更贴近期望的随机遮挡场景；
     # - center：在图像中心生成方形掩码，适合特定分布或验证一致性。
     
-    # 首先加载完整的训练数据集
+    # 首先加载完整的训练数据集（用于训练，带增强）
     full_train_dataset = ImageInpaintingDataset(
         data_dir=DATA_DIR_TRAIN,
         transform=train_transform,
@@ -138,13 +138,10 @@ def main():
         external_mask_dilate=0,
         external_mask_mode="random"
     )
-    
-    # 从训练集中分割最后20%作为测试集
-    train_dataset = TrainTestSplitDataset(full_train_dataset, test_ratio=0.2, is_test=False)
-    test_dataset = TrainTestSplitDataset(full_train_dataset, test_ratio=0.2, is_test=True)
-    
-    val_dataset = ImageInpaintingDataset(
-        data_dir=DATA_DIR_VAL,
+
+    # 同一训练目录的评估视图（用于val/test评估，无增强，掩码选择可复现）
+    full_train_eval_dataset = ImageInpaintingDataset(
+        data_dir=DATA_DIR_TRAIN,
         transform=val_test_transform,
         mask_type=MASK_TYPE,
         mask_dir="../data/mask",
@@ -153,6 +150,20 @@ def main():
         external_mask_dilate=0,
         external_mask_mode="cycle"
     )
+
+    # 划分比例：训练70%，验证10%，测试20%（均取自训练集）
+    total = len(full_train_dataset)
+    test_size = int(total * 0.20)
+    val_size = int(total * 0.10)
+    train_size = max(0, total - test_size - val_size)
+
+    train_indices = list(range(0, train_size))
+    val_indices = list(range(train_size, train_size + val_size))
+    test_indices = list(range(total - test_size, total))
+
+    train_dataset = Subset(full_train_dataset, train_indices)
+    val_dataset = Subset(full_train_eval_dataset, val_indices)
+    test_dataset = Subset(full_train_eval_dataset, test_indices)
     def visualize_samples(dataset, out_dir, prefix, count=3):
         os.makedirs(out_dir, exist_ok=True)
         n = min(count, len(dataset))
@@ -172,6 +183,7 @@ def main():
     visualize_samples(test_dataset, preview_dir, "test", count=2)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
     # DataLoader 提示：Windows 平台上 num_workers 过大可能导致启动缓慢或卡住；
     # 如遇问题可将训练/验证的 num_workers 降为 0 或 1 进行排查。
 
@@ -186,8 +198,8 @@ def main():
 
     opt_gen = Adam(gen.parameters(), lr=LEARNING_RATE, betas=ADAM_BETAS)
     opt_dis = Adam(dis.parameters(), lr=LEARNING_RATE, betas=ADAM_BETAS)
-    scaler_gen = GradScaler(device='cuda', enabled=USE_MIXED_PRECISION)
-    scaler_dis = GradScaler(device='cuda', enabled=USE_MIXED_PRECISION)
+    scaler_gen = GradScaler(device_type='cuda', enabled=USE_MIXED_PRECISION)
+    scaler_dis = GradScaler(device_type='cuda', enabled=USE_MIXED_PRECISION)
 
     # 记录最佳验证损失（用于保存最佳模型）
     best_val_loss = float('inf')
@@ -261,19 +273,42 @@ def main():
                 loss_gen = LAMBDA_GAN * loss_gan + LAMBDA_L1 * loss_l1 + LAMBDA_PERCEPTUAL * loss_percep
                 val_gen_loss_total += loss_gen.item()
 
-        # 计算验证集平均损失
-        avg_val_gen_loss = val_gen_loss_total / len(val_loader)
-        print(f"Epoch {epoch+1} Val: Gen Loss={avg_val_gen_loss:.4f}")
-
-        # 保存最佳模型（基于验证损失）
-        if avg_val_gen_loss < best_val_loss:
-            best_val_loss = avg_val_gen_loss
-            torch.save(gen.state_dict(), os.path.join(SAVE_MODEL_DIR, "gen_best.pth"))
-            torch.save(dis.state_dict(), os.path.join(SAVE_MODEL_DIR, "dis_best.pth"))
-            print(f"Best model saved (Val Loss: {best_val_loss:.4f})")
+        val_batches = len(val_loader)
+        if val_batches == 0:
+            print(f"Epoch {epoch+1} Val: skipped (empty)")
+        else:
+            avg_val_gen_loss = val_gen_loss_total / val_batches
+            print(f"Epoch {epoch+1} Val: Gen Loss={avg_val_gen_loss:.4f}")
+            if avg_val_gen_loss < best_val_loss:
+                best_val_loss = avg_val_gen_loss
+                torch.save(gen.state_dict(), os.path.join(SAVE_MODEL_DIR, "gen_best.pth"))
+                torch.save(dis.state_dict(), os.path.join(SAVE_MODEL_DIR, "dis_best.pth"))
+                print(f"Best model saved (Val Loss: {best_val_loss:.4f})")
 
         # 每10个epoch额外保存一次
         # 保存频率说明：当前硬编码为 10；如需与 config.SAVE_FREQ 保持一致，可改为读取配置常量。
+        # -------------------------- 测试评估 --------------------------
+        test_gen_loss_total = 0.0
+        with torch.no_grad():
+            for real_imgs, masks in tqdm(test_loader, desc=f"Epoch {epoch+1}/{EPOCHS} (Test)"):
+                real_imgs = real_imgs.to(device)
+                masks = masks.to(device)
+                with autocast(device_type='cuda', enabled=USE_MIXED_PRECISION):
+                    fake_imgs = gen(real_imgs, masks)
+                fake_pred = dis(fake_imgs)
+                loss_gan = gan_loss(fake_pred, target_is_real=True)
+                loss_l1 = l1_masked_loss(fake_imgs, real_imgs, masks)
+                loss_percep = perceptual_loss(fake_imgs, real_imgs)
+                loss_gen = LAMBDA_GAN * loss_gan + LAMBDA_L1 * loss_l1 + LAMBDA_PERCEPTUAL * loss_percep
+                test_gen_loss_total += loss_gen.item()
+
+        test_batches = len(test_loader)
+        if test_batches == 0:
+            print(f"Epoch {epoch+1} Test: skipped (empty)")
+        else:
+            avg_test_gen_loss = test_gen_loss_total / test_batches
+            print(f"Epoch {epoch+1} Test: Gen Loss={avg_test_gen_loss:.4f}")
+
         if (epoch + 1) % SAVE_FREQ == 0:
             torch.save(gen.state_dict(), os.path.join(SAVE_MODEL_DIR, f"gen_epoch_{epoch+1}.pth"))
             torch.save(dis.state_dict(), os.path.join(SAVE_MODEL_DIR, f"dis_epoch_{epoch+1}.pth"))
