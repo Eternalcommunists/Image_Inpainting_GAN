@@ -198,8 +198,8 @@ def main():
 
     opt_gen = Adam(gen.parameters(), lr=LEARNING_RATE, betas=ADAM_BETAS)
     opt_dis = Adam(dis.parameters(), lr=LEARNING_RATE, betas=ADAM_BETAS)
-    scaler_gen = GradScaler(device_type='cuda', enabled=USE_MIXED_PRECISION)
-    scaler_dis = GradScaler(device_type='cuda', enabled=USE_MIXED_PRECISION)
+    scaler_gen = GradScaler(device='cuda', enabled=USE_MIXED_PRECISION)
+    scaler_dis = GradScaler(device='cuda', enabled=USE_MIXED_PRECISION)
 
     # 记录最佳验证损失（用于保存最佳模型）
     best_val_loss = float('inf')
